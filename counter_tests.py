@@ -13,6 +13,109 @@ from tools.decorators import since
 
 class TestCounters(Tester):
 
+    @since('3.0', max_version='3.12')
+    def test_13691(self):
+        """
+        2.0 -> 2.1 -> 3.0 counters upgrade test
+        @jira_ticket CASSANDRA-13691
+        """
+        cluster = self.cluster
+        default_install_dir = cluster.get_install_dir()
+
+        #
+        # set up a 2.0 cluster with 3 nodes and set up schema
+        #
+
+        cluster.set_install_dir(version='2.0.17')
+        cluster.populate(3)
+        cluster.start()
+
+        node1, node2, node3 = cluster.nodelist()
+
+        session = self.patient_cql_connection(node1)
+        session.execute("""
+            CREATE KEYSPACE test
+                WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+            """)
+        session.execute("CREATE TABLE test.test (id int PRIMARY KEY, c counter);")
+
+        #
+        # generate some 2.0 counter columns with local shards
+        #
+
+        query = "UPDATE test.test SET c = c + 1 WHERE id = ?"
+        prepared = session.prepare(query)
+        for i in range(0, 1000):
+            session.execute(prepared, [i])
+
+        cluster.flush()
+        cluster.stop()
+
+        #
+        # upgrade cluster to 2.1
+        #
+
+        cluster.set_install_dir(version='2.1.17')
+        cluster.start();
+        cluster.nodetool("upgradesstables")
+
+        #
+        # upgrade node3 to current (3.0.x or 3.11.x)
+        #
+
+        node3.stop(wait_other_notice=True)
+        node3.set_install_dir(install_dir=default_install_dir)
+        node3.start(wait_other_notice=True)
+
+        #
+        # with a 2.1 coordinator, try to read the table with CL.ALL
+        #
+
+        session = self.patient_cql_connection(node1, consistency_level=ConsistencyLevel.ALL)
+        assert_one(session, "SELECT COUNT(*) FROM test.test", [1000])
+
+    def counter_leader_with_partial_view_test(self):
+        """
+        Test leader election with a starting node.
+
+        Testing that nodes do not elect as mutation leader a node with a partial view on the cluster.
+        Note that byteman rules can be syntax checked via the following command:
+            sh ./bin/bytemancheck.sh -cp ~/path_to/apache-cassandra-3.0.14-SNAPSHOT.jar ~/path_to/rule.btm
+
+        @jira_ticket CASSANDRA-13043
+        """
+        cluster = self.cluster
+
+        cluster.populate(3, use_vnodes=True, install_byteman=True)
+        nodes = cluster.nodelist()
+        # Have node 1 and 3 cheat a bit during the leader election for a counter mutation; note that cheating
+        # takes place iff there is an actual chance for node 2 to be picked.
+        nodes[0].update_startup_byteman_script('./byteman/election_counter_leader_favor_node2.btm')
+        nodes[2].update_startup_byteman_script('./byteman/election_counter_leader_favor_node2.btm')
+        cluster.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(nodes[0])
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', validation="CounterColumnType", columns={'c': 'counter'})
+
+        # Now stop the node and restart but first install a rule to slow down how fast node 2 will update the list
+        # nodes that are alive
+        nodes[1].stop(wait=True, wait_other_notice=False)
+        nodes[1].update_startup_byteman_script('./byteman/gossip_alive_callback_sleep.btm')
+        nodes[1].start(no_wait=True, wait_other_notice=False)
+
+        # Until node 2 is fully alive try to force other nodes to pick him as mutation leader.
+        # If CASSANDRA-13043 is fixed, they will not. Otherwise they will do, but since we are slowing down how
+        # fast node 2 updates the list of nodes that are alive, it will just have a partial view on the cluster
+        # and thus will raise an 'UnavailableException' exception.
+        nb_attempts = 50000
+        for i in xrange(0, nb_attempts):
+            # Change the name of the counter for the sake of randomization
+            q = SimpleStatement(
+                query_string="UPDATE ks.cf SET c = c + 1 WHERE key = 'counter_%d'" % i,
+                consistency_level=ConsistencyLevel.QUORUM
+            )
+            session.execute(q)
+
     def simple_increment_test(self):
         """ Simple incrementation test (Created for #3465, that wasn't a bug) """
         cluster = self.cluster

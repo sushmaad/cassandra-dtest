@@ -7,7 +7,8 @@ from functools import partial
 from multiprocessing import Process, Queue
 from unittest import skip, skipIf
 
-from cassandra import ConsistencyLevel
+from cassandra import ConsistencyLevel, WriteFailure
+from cassandra.cluster import NoHostAvailable
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.cluster import Cluster
 from cassandra.query import SimpleStatement
@@ -21,6 +22,7 @@ from dtest import Tester, debug, get_ip_from_node, create_ks
 from tools.assertions import (assert_all, assert_crc_check_chance_equal,
                               assert_invalid, assert_none, assert_one,
                               assert_unavailable)
+from tools.data import rows_to_list
 from tools.decorators import since
 from tools.misc import new_node
 from tools.jmxutils import (JolokiaAgent, make_mbean, remove_perf_disable_shared_mem)
@@ -40,9 +42,13 @@ class TestMaterializedViews(Tester):
     @since 3.0
     """
 
-    def prepare(self, user_table=False, rf=1, options=None, nodes=3, **kwargs):
+    def _rows_to_list(self, rows):
+        new_list = [list(row) for row in rows]
+        return new_list
+
+    def prepare(self, user_table=False, rf=1, options=None, nodes=3, install_byteman=False, **kwargs):
         cluster = self.cluster
-        cluster.populate([nodes, 0])
+        cluster.populate([nodes, 0], install_byteman=install_byteman)
         if options:
             cluster.set_configuration_options(values=options)
         cluster.start()
@@ -64,6 +70,14 @@ class TestMaterializedViews(Tester):
                              "PRIMARY KEY (state, username)"))
 
         return session
+
+    def update_view(self, session, query, flush, compact=False):
+        session.execute(query)
+        self._replay_batchlogs()
+        if flush:
+            self.cluster.flush()
+        if compact:
+            self.cluster.compact()
 
     def _settle_nodes(self):
         debug("Settling all nodes")
@@ -115,10 +129,14 @@ class TestMaterializedViews(Tester):
         self._settle_nodes()
 
     def _replay_batchlogs(self):
-        debug("Replaying batchlog on all nodes")
         for node in self.cluster.nodelist():
             if node.is_running():
+                debug("Replaying batchlog on node {}".format(node.name))
                 node.nodetool("replaybatchlog")
+                # CASSANDRA-13069 - Ensure replayed mutations are removed from the batchlog
+                node_session = self.patient_exclusive_cql_connection(node)
+                result = list(node_session.execute("SELECT count(*) FROM system.batches;"))
+                self.assertEqual(result[0].count, 0)
 
     def create_test(self):
         """Test the materialized view creation"""
@@ -227,7 +245,6 @@ class TestMaterializedViews(Tester):
 
         debug("wait that all batchlogs are replayed")
         self._replay_batchlogs()
-
         for i in xrange(5):
             for j in xrange(10000):
                 assert_one(session, "SELECT * FROM t_by_v WHERE id = {} AND v = {}".format(i, j), [j, i])
@@ -334,7 +351,7 @@ class TestMaterializedViews(Tester):
         assert_invalid(
             session,
             "ALTER TABLE ks.users DROP state;",
-            "Cannot drop column state, depended on by materialized views"
+            "Cannot drop column state on base table with materialized views."
         )
 
     def drop_table_test(self):
@@ -773,6 +790,74 @@ class TestMaterializedViews(Tester):
             ['TX', 'user1']
         )
 
+    def rename_column_test(self):
+        """
+        Test that a materialized view created with a 'SELECT *' works as expected when renaming a column
+        @expected_result The column is also renamed in the view.
+        """
+
+        session = self.prepare(user_table=True)
+
+        self._insert_data(session)
+
+        assert_one(
+            session,
+            "SELECT * FROM users_by_state WHERE state = 'TX' AND username = 'user1'",
+            ['TX', 'user1', 1968, 'f', 'ch@ngem3a', None]
+        )
+
+        session.execute("ALTER TABLE users RENAME username TO user")
+
+        results = list(session.execute("SELECT * FROM users_by_state WHERE state = 'TX' AND user = 'user1'"))
+        self.assertEqual(len(results), 1)
+        self.assertTrue(hasattr(results[0], 'user'), 'Column "user" not found')
+        assert_one(
+            session,
+            "SELECT state, user, birth_year, gender FROM users_by_state WHERE state = 'TX' AND user = 'user1'",
+            ['TX', 'user1', 1968, 'f']
+        )
+
+    def rename_column_atomicity_test(self):
+        """
+        Test that column renaming is atomically done between a table and its materialized views
+        @jira_ticket CASSANDRA-12952
+        """
+
+        session = self.prepare(nodes=1, user_table=True, install_byteman=True)
+        node = self.cluster.nodelist()[0]
+
+        self._insert_data(session)
+
+        assert_one(
+            session,
+            "SELECT * FROM users_by_state WHERE state = 'TX' AND username = 'user1'",
+            ['TX', 'user1', 1968, 'f', 'ch@ngem3a', None]
+        )
+
+        # Rename a column with an injected byteman rule to kill the node after the first schema update
+        self.allow_log_errors = True
+        script_version = '4x' if self.cluster.version() >= '4' else '3x'
+        node.byteman_submit(['./byteman/merge_schema_failure_{}.btm'.format(script_version)])
+        with self.assertRaises(NoHostAvailable):
+            session.execute("ALTER TABLE users RENAME username TO user")
+
+        debug('Restarting node')
+        node.stop()
+        node.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(node, consistency_level=ConsistencyLevel.ONE)
+
+        # Both the table and its view should have the new schema after restart
+        assert_one(
+            session,
+            "SELECT * FROM ks.users WHERE state = 'TX' AND user = 'user1' ALLOW FILTERING",
+            ['user1', 1968, 'f', 'ch@ngem3a', None, 'TX']
+        )
+        assert_one(
+            session,
+            "SELECT * FROM ks.users_by_state WHERE state = 'TX' AND user = 'user1'",
+            ['TX', 'user1', 1968, 'f', 'ch@ngem3a', None]
+        )
+
     def lwt_test(self):
         """Test that lightweight transaction behave properly with a materialized view"""
 
@@ -906,6 +991,357 @@ class TestMaterializedViews(Tester):
                 cl=ConsistencyLevel.ALL
             )
 
+    @since('3.0')
+    def test_no_base_column_in_view_pk_complex_timestamp_with_flush(self):
+        self._test_no_base_column_in_view_pk_complex_timestamp(flush=True)
+
+    @since('3.0')
+    def test_no_base_column_in_view_pk_complex_timestamp_without_flush(self):
+        self._test_no_base_column_in_view_pk_complex_timestamp(flush=False)
+
+    def _test_no_base_column_in_view_pk_complex_timestamp(self, flush):
+        """
+        Able to shadow old view row if all columns in base are removed including unselected
+        Able to recreate view row if at least one selected column alive
+
+        @jira_ticket CASSANDRA-11500
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1, node2, node3 = self.cluster.nodelist()
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (k int, c int, a int, b int, e int, f int, primary key(k, c))")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT k,c,a,b FROM t "
+                         "WHERE k IS NOT NULL AND c IS NOT NULL PRIMARY KEY (c, k)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # update unselected, view row should be alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 1 SET e=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, 1, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        # remove unselected, add selected column, view row should be alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 2 SET e=null, b=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, 1, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, 1])
+
+        # remove selected column, view row is removed
+        self.update_view(session, "UPDATE t USING TIMESTAMP 2 SET e=null, b=null WHERE k=1 AND c=1;", flush)
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+        # update unselected with ts=3, view row should be alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 3 SET f=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, None, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        # insert livenesssInfo, view row should be alive
+        self.update_view(session, "INSERT INTO t(k,c) VALUES(1,1) USING TIMESTAMP 3", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, None, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        # remove unselected, view row should be alive because of base livenessInfo alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 3 SET f=null WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        # add selected column, view row should be alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 3 SET a=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, None, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1, None])
+
+        # update unselected, view row should be alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 4 SET f=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, None, None, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1, None])
+
+        # delete with ts=3, view row should be alive due to unselected@ts4
+        self.update_view(session, "DELETE FROM t USING TIMESTAMP 3 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, None, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        # remove unselected, view row should be removed
+        self.update_view(session, "UPDATE t USING TIMESTAMP 4 SET f=null WHERE k=1 AND c=1;", flush)
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+        # add selected with ts=7, view row is alive
+        self.update_view(session, "UPDATE t USING TIMESTAMP 7 SET b=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, 1, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, 1])
+
+        # remove selected with ts=7, view row is dead
+        self.update_view(session, "UPDATE t USING TIMESTAMP 7 SET b=null WHERE k=1 AND c=1;", flush)
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+        # add selected with ts=5, view row is alive (selected column should not affects each other)
+        self.update_view(session, "UPDATE t USING TIMESTAMP 5 SET a=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, None, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1, None])
+
+        # add selected with ttl=5
+        self.update_view(session, "UPDATE t USING TTL 10 SET a=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, 1, None, None, None])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1, None])
+
+        time.sleep(10)
+
+        # update unselected with ttl=10, view row should be alive
+        self.update_view(session, "UPDATE t USING TTL 10 SET f=1 WHERE k=1 AND c=1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None, None, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, None, None])
+
+        time.sleep(10)
+
+        # view row still alive due to base livenessInfo
+        assert_none(session, "SELECT * FROM t")
+        assert_none(session, "SELECT * FROM mv")
+
+    @since('3.0')
+    def test_base_column_in_view_pk_complex_timestamp_with_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=True)
+
+    @since('3.0')
+    def test_base_column_in_view_pk_complex_timestamp_without_flush(self):
+        self._test_base_column_in_view_pk_complex_timestamp(flush=False)
+
+    def _test_base_column_in_view_pk_complex_timestamp(self, flush):
+        """
+        Able to shadow old view row with column ts greater than pk's ts and re-insert the view row
+        Able to shadow old view row with column ts smaller than pk's ts and re-insert the view row
+
+        @jira_ticket CASSANDRA-11500
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1, node2, node3 = self.cluster.nodelist()
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, a int, b int)")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t "
+                         "WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        # Set initial values TS=1
+        self.update_view(session, "INSERT INTO t (k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 1;", flush)
+        assert_one(session, "SELECT * FROM t", [1, 1, 1])
+        assert_one(session, "SELECT * FROM mv", [1, 1, 1])
+
+        # increase b ts to 10
+        self.update_view(session, "UPDATE t USING TIMESTAMP 10 SET b = 2 WHERE k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        self.update_view(session, "UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+        # switch entries. shadow a = 2, insert a = 1
+        self.update_view(session, "UPDATE t USING TIMESTAMP 3 SET a = 1 WHERE k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+
+        # switch entries. shadow a = 1, insert a = 2
+        self.update_view(session, "UPDATE t USING TIMESTAMP 4 SET a = 2 WHERE k = 1;", flush, compact=True)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 2, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 2, 10])
+
+        # able to shadow view row even if base-column in view pk's ts is smaller than row timestamp
+        # set row TS = 20, a@6, b@20
+        self.update_view(session, "DELETE FROM t USING TIMESTAMP 5 where k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, None, 2, 10])
+        assert_none(session, "SELECT k,a,b,writetime(b) FROM mv")
+        self.update_view(session, "INSERT INTO t (k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 6;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 2, 10])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 2, 10])
+        self.update_view(session, "INSERT INTO t (k, b) VALUES (1, 1) USING TIMESTAMP 20;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM t", [1, 1, 1, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 1, 20])
+
+        # switch entries. shadow a = 1, insert a = 2
+        self.update_view(session, "UPDATE t USING TIMESTAMP 7 SET a = 2 WHERE k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(a),writetime(b) FROM t", [1, 2, 1, 7, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 2, 1, 20])
+
+        # switch entries. shadow a = 2, insert a = 1
+        self.update_view(session, "UPDATE t USING TIMESTAMP 8 SET a = 1 WHERE k = 1;", flush)
+        assert_one(session, "SELECT k,a,b,writetime(a),writetime(b) FROM t", [1, 1, 1, 8, 20])
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv", [1, 1, 1, 20])
+
+        # create another view row
+        self.update_view(session, "INSERT INTO t (k, a, b) VALUES (2, 2, 2);", flush)
+        assert_one(session, "SELECT k,a,b FROM t WHERE k = 2", [2, 2, 2])
+        assert_one(session, "SELECT k,a,b FROM mv WHERE k = 2", [2, 2, 2])
+
+        # stop node2, node3
+        debug('Shutdown node2')
+        node2.stop(wait_other_notice=True)
+        debug('Shutdown node3')
+        node3.stop(wait_other_notice=True)
+        # shadow a = 1, create a = 2
+        query = SimpleStatement("UPDATE t USING TIMESTAMP 9 SET a = 2 WHERE k = 1", consistency_level=ConsistencyLevel.ONE)
+        self.update_view(session, query, flush)
+        # shadow (a=2, k=2) after 3 second
+        query = SimpleStatement("UPDATE t USING TTL 3 SET a = 2 WHERE k = 2", consistency_level=ConsistencyLevel.ONE)
+        self.update_view(session, query, flush)
+
+        debug('Starting node2')
+        node2.start(wait_other_notice=True, wait_for_binary_proto=True)
+        debug('Starting node3')
+        node3.start(wait_other_notice=True, wait_for_binary_proto=True)
+
+        # For k = 1 & a = 1, We should get a digest mismatch of tombstones and repaired
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 1 AND a = 1", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        self.assertEqual(0, len(result.current_rows))
+
+        # For k = 1 & a = 1, second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        assert_none(session, "SELECT * FROM mv WHERE k = 1 AND a = 1")
+        self.assertEqual(0, len(result.current_rows))
+
+        # For k = 1 & a = 2, We should get a digest mismatch of data and repaired for a = 2
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 1 AND a = 2", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        self.assertEqual(1, len(result.current_rows))
+
+        # For k = 1 & a = 2, second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        self.assertEqual(1, len(result.current_rows))
+        assert_one(session, "SELECT k,a,b,writetime(b) FROM mv WHERE k = 1", [1, 2, 1, 20])
+
+        time.sleep(3)
+        # For k = 2 & a = 2, We should get a digest mismatch of expired and repaired
+        query = SimpleStatement("SELECT * FROM mv WHERE k = 2 AND a = 2", consistency_level=ConsistencyLevel.ALL)
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), True)
+        debug(result.current_rows)
+        self.assertEqual(0, len(result.current_rows))
+
+        # For k = 2 & a = 2, second time no digest mismatch
+        result = session.execute(query, trace=True)
+        self.check_trace_events(result.get_query_trace(), False)
+        self.assertEqual(0, len(result.current_rows))
+
+    @since('3.0')
+    def test_expired_liveness_with_limit_rf1_nodes1(self):
+        self._test_expired_liveness_with_limit(rf=1, nodes=1)
+
+    @since('3.0')
+    def test_expired_liveness_with_limit_rf1_nodes3(self):
+        self._test_expired_liveness_with_limit(rf=1, nodes=3)
+
+    @since('3.0')
+    def test_expired_liveness_with_limit_rf3(self):
+        self._test_expired_liveness_with_limit(rf=3, nodes=3)
+
+    def _test_expired_liveness_with_limit(self, rf, nodes):
+        """
+        Test MV with expired liveness limit is properly handled
+
+        @jira_ticket CASSANDRA-13883
+        """
+        session = self.prepare(rf=rf, nodes=nodes, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (k int PRIMARY KEY, a int, b int)")
+        session.execute(("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t "
+                         "WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        for k in xrange(100):
+            session.execute("INSERT INTO t (k, a, b) VALUES ({}, {}, {})".format(k, k, k))
+
+        # generate view row with expired liveness except for row 50 and 99
+        for k in xrange(100):
+            if k == 50 or k == 99:
+                continue
+            session.execute("DELETE a FROM t where k = {};".format(k))
+
+        # there should be 2 live data
+        assert_one(session, "SELECT k,a,b FROM mv limit 1", [50, 50, 50])
+        assert_all(session, "SELECT k,a,b FROM mv limit 2", [[50, 50, 50], [99, 99, 99]])
+        assert_all(session, "SELECT k,a,b FROM mv", [[50, 50, 50], [99, 99, 99]])
+
+        # verify IN
+        keys = xrange(100)
+        assert_one(session, "SELECT k,a,b FROM mv WHERE k in ({}) limit 1".format(', '.join(str(x) for x in keys)),
+                   [50, 50, 50])
+        assert_all(session, "SELECT k,a,b FROM mv WHERE k in ({}) limit 2".format(', '.join(str(x) for x in keys)),
+                   [[50, 50, 50], [99, 99, 99]])
+        assert_all(session, "SELECT k,a,b FROM mv WHERE k in ({})".format(', '.join(str(x) for x in keys)),
+                   [[50, 50, 50], [99, 99, 99]])
+
+        # verify fetch size
+        session.default_fetch_size = 1
+        assert_one(session, "SELECT k,a,b FROM mv limit 1", [50, 50, 50])
+        assert_all(session, "SELECT k,a,b FROM mv limit 2", [[50, 50, 50], [99, 99, 99]])
+        assert_all(session, "SELECT k,a,b FROM mv", [[50, 50, 50], [99, 99, 99]])
+
+    @since('3.0')
+    def test_base_column_in_view_pk_commutative_tombstone_with_flush(self):
+        self._test_base_column_in_view_pk_commutative_tombstone_(flush=True)
+
+    @since('3.0')
+    def test_base_column_in_view_pk_commutative_tombstone_without_flush(self):
+        self._test_base_column_in_view_pk_commutative_tombstone_(flush=False)
+
+    def _test_base_column_in_view_pk_commutative_tombstone_(self, flush):
+        """
+        view row deletion should be commutative with newer view livenessInfo, otherwise deleted columns may be resurrected.
+        @jira_ticket CASSANDRA-13409
+        """
+        session = self.prepare(rf=3, nodes=3, options={'hinted_handoff_enabled': False}, consistency_level=ConsistencyLevel.QUORUM)
+        node1 = self.cluster.nodelist()[0]
+
+        session.execute('USE ks')
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v,id)"))
+        session.cluster.control_connection.wait_for_schema_agreement()
+        for node in self.cluster.nodelist():
+            node.nodetool("disableautocompaction")
+
+        # sstable 1, Set initial values TS=1
+        self.update_view(session, "INSERT INTO t (id, v, v2, v3) VALUES (1, 1, 'a', 3.0) USING TIMESTAMP 1", flush)
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, 'a', 3.0])
+
+        # sstable 2, change v's value and TS=2, tombstones v=1 and adds v=0 record
+        self.update_view(session, "DELETE FROM t USING TIMESTAMP 2 WHERE id = 1;", flush)
+        assert_none(session, "SELECT * FROM t_by_v")
+        assert_none(session, "SELECT * FROM t")
+
+        # sstable 3, tombstones of mv created by base deletion should remain.
+        self.update_view(session, "INSERT INTO t (id, v) VALUES (1, 1) USING TIMESTAMP 3", flush)
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None])
+
+        # sstable 4, shadow view row (id=1, v=1), insert (id=1, v=2, ts=4)
+        self.update_view(session, "UPDATE t USING TIMESTAMP 4 set v = 2 WHERE id = 1;", flush)
+        assert_one(session, "SELECT * FROM t_by_v", [2, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 2, None, None])
+
+        # sstable 5, shadow view row (id=1, v=2), insert (id=1, v=1 ts=5)
+        self.update_view(session, "UPDATE t USING TIMESTAMP 5 set v = 1 WHERE id = 1;", flush)
+        assert_one(session, "SELECT * FROM t_by_v", [1, 1, None, None])
+        assert_one(session, "SELECT * FROM t", [1, 1, None, None])  # data deleted by row-tombstone@2 should not resurrect
+
+        if flush:
+            self.cluster.compact()
+            assert_one(session, "SELECT * FROM t_by_v", [1, 1, None, None])
+            assert_one(session, "SELECT * FROM t", [1, 1, None, None])  # data deleted by row-tombstone@2 should not resurrect
+
+        # shadow view row (id=1, v=1)
+        self.update_view(session, "UPDATE t USING TIMESTAMP 5 set v = null WHERE id = 1;", flush)
+        assert_none(session, "SELECT * FROM t_by_v")
+        assert_one(session, "SELECT * FROM t", [1, None, None, None])
+
     def view_tombstone_test(self):
         """
         Test that a materialized views properly tombstone
@@ -995,8 +1431,9 @@ class TestMaterializedViews(Tester):
         # execution happening
 
         # Look for messages like:
-        #         Digest mismatch: org.apache.cassandra.service.DigestMismatchException: Mismatch for key DecoratedKey
-        regex = r"Digest mismatch: org.apache.cassandra.service.DigestMismatchException: Mismatch for key DecoratedKey"
+        #  4.0+        Digest mismatch: Mismatch for key DecoratedKey
+        # <4.0         Digest mismatch: org.apache.cassandra.service.DigestMismatchException: Mismatch for key DecoratedKey
+        regex = r"Digest mismatch: ([a-zA-Z.]+:\s)?Mismatch for key DecoratedKey"
         for event in trace.events:
             desc = event.description
             match = re.match(regex, desc)
@@ -1009,7 +1446,13 @@ class TestMaterializedViews(Tester):
             if expect_digest:
                 self.fail("Didn't find digest mismatch")
 
-    def simple_repair_test(self):
+    def simple_repair_test_by_base(self):
+        self._simple_repair_test(repair_base=True)
+
+    def simple_repair_test_by_view(self):
+        self._simple_repair_test(repair_view=True)
+
+    def _simple_repair_test(self, repair_base=False, repair_view=False):
         """
         Test that a materialized view are consistent after a simple repair.
         """
@@ -1053,16 +1496,20 @@ class TestMaterializedViews(Tester):
 
         debug('Start node2, and repair')
         node2.start(wait_other_notice=True, wait_for_binary_proto=True)
-        node1.repair()
+        if repair_base:
+            node1.nodetool("repair ks t")
+        if repair_view:
+            node1.nodetool("repair ks t_by_v")
 
-        debug('Verify the data in the MV with CL=ONE. All should be available now.')
+        debug('Verify the data in the MV with CL=ALL. All should be available now and no digest mismatch')
         for i in xrange(1000):
-            assert_one(
-                session,
+            query = SimpleStatement(
                 "SELECT * FROM t_by_v WHERE v = {}".format(i),
-                [i, i, 'a', 3.0],
-                cl=ConsistencyLevel.ONE
+                consistency_level=ConsistencyLevel.ALL
             )
+            result = session.execute(query, trace=True)
+            self.check_trace_events(result.get_query_trace(), False)
+            self.assertEquals(self._rows_to_list(result.current_rows), [[i, i, 'a', 3.0]])
 
     def base_replica_repair_test(self):
         self._base_replica_repair_test()
@@ -1247,6 +1694,115 @@ class TestMaterializedViews(Tester):
                 [v, v, 'a', 3.0],
                 cl=ConsistencyLevel.QUORUM
             )
+
+    @attr('resource-intensive')
+    def throttled_partition_update_test(self):
+        """
+        @jira_ticket: CASSANDRA-13299, test break up large partition when repairing base with mv.
+
+        Provide a configuable batch size(cassandra.mv.mutation.row.count=100) to trottle number
+        of rows to be applied in one mutation
+        """
+
+        session = self.prepare(rf=5, options={'hinted_handoff_enabled': False}, nodes=5)
+        node1, node2, node3, node4, node5 = self.cluster.nodelist()
+
+        for node in self.cluster.nodelist():
+            node.nodetool("disableautocompaction")
+
+        session.execute("CREATE TABLE ks.t (pk int, ck1 int, ck2 int, v1 int, v2 int, PRIMARY KEY(pk, ck1, ck2))")
+        session.execute(("CREATE MATERIALIZED VIEW ks.t_by_v AS SELECT * FROM t "
+                         "WHERE pk IS NOT NULL AND ck1 IS NOT NULL AND ck2 IS NOT NULL "
+                         "PRIMARY KEY (pk, ck2, ck1)"))
+
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        debug('Shutdown node2 and node3')
+        node2.stop(wait_other_notice=True)
+        node3.stop(wait_other_notice=True)
+
+        size = 50
+        range_deletion_ts = 30
+        partition_deletion_ts = 10
+
+        for ck1 in xrange(size):
+            for ck2 in xrange(size):
+                session.execute("INSERT INTO ks.t (pk, ck1, ck2, v1, v2)"
+                                " VALUES (1, {}, {}, {}, {}) USING TIMESTAMP {}".format(ck1, ck2, ck1, ck2, ck1))
+
+        self._replay_batchlogs()
+
+        for ck1 in xrange(size):
+            for ck2 in xrange(size):
+                assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND ck1={} AND ck2={}".format(ck1, ck2),
+                           [1, ck1, ck2, ck1, ck2])
+                assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND ck1={} AND ck2={}".format(ck1, ck2),
+                           [1, ck1, ck2, ck1, ck2])
+
+        debug('Shutdown node4 and node5')
+        node4.stop(wait_other_notice=True)
+        node5.stop(wait_other_notice=True)
+
+        for ck1 in xrange(size):
+            for ck2 in xrange(size):
+                if ck1 % 2 == 0:  # range tombstone
+                    session.execute("DELETE FROM ks.t USING TIMESTAMP 50 WHERE pk=1 AND ck1={}".format(ck1))
+                elif ck1 == ck2:  # row tombstone
+                    session.execute("DELETE FROM ks.t USING TIMESTAMP 60 WHERE pk=1 AND ck1={} AND ck2={}".format(ck1, ck2))
+                elif ck1 == ck2 - 1:  # cell tombstone
+                    session.execute("DELETE v2 FROM ks.t USING TIMESTAMP 70 WHERE pk=1 AND ck1={} AND ck2={}".format(ck1, ck2))
+
+        # range deletion
+        session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1 and ck1 < 30 and ck1 > 20".format(range_deletion_ts))
+        session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1 and ck1 = 20 and ck2 < 10".format(range_deletion_ts))
+
+        # partition deletion for ck1 <= partition_deletion_ts
+        session.execute("DELETE FROM ks.t USING TIMESTAMP {} WHERE pk=1".format(partition_deletion_ts))
+        self._replay_batchlogs()
+
+        # start nodes with different batch size
+        debug('Starting nodes')
+        node2.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=["-Dcassandra.repair.mutation_repair_rows_per_batch={}".format(2)])
+        node3.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=["-Dcassandra.repair.mutation_repair_rows_per_batch={}".format(5)])
+        node4.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=["-Dcassandra.repair.mutation_repair_rows_per_batch={}".format(50)])
+        node5.start(wait_other_notice=True, wait_for_binary_proto=True, jvm_args=["-Dcassandra.repair.mutation_repair_rows_per_batch={}".format(5000)])
+        self._replay_batchlogs()
+
+        debug('repairing base table')
+        node1.nodetool("repair ks t")
+        self._replay_batchlogs()
+
+        debug('stop cluster')
+        self.cluster.stop()
+
+        debug('rolling restart to check repaired data on each node')
+        for node in self.cluster.nodelist():
+            debug('starting {}'.format(node.name))
+            node.start(wait_other_notice=True, wait_for_binary_proto=True)
+            session = self.patient_cql_connection(node, consistency_level=ConsistencyLevel.ONE)
+            for ck1 in xrange(size):
+                for ck2 in xrange(size):
+                    if (
+                        ck1 <= partition_deletion_ts or  # partition deletion
+                        ck1 == ck2 or ck1 % 2 == 0 or  # row deletion or range tombstone
+                        (ck1 > 20 and ck1 < 30) or (ck1 == 20 and ck2 < 10)  # range tombstone
+                    ):
+                        assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                             "ck1={} AND ck2={}".format(ck1, ck2))
+                        assert_none(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                             "ck1={} AND ck2={}".format(ck1, ck2))
+                    elif ck1 == ck2 - 1:  # cell tombstone
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, None])
+                    else:
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t_by_v WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
+                        assert_one(session, "SELECT pk,ck1,ck2,v1,v2 FROM ks.t WHERE pk=1 AND "
+                                            "ck1={} AND ck2={}".format(ck1, ck2), [1, ck1, ck2, ck1, ck2])
+            debug('stopping {}'.format(node.name))
+            node.stop(wait_other_notice=True, wait_for_binary_proto=True)
 
     @attr('resource-intensive')
     def really_complex_repair_test(self):
@@ -1462,6 +2018,122 @@ class TestMaterializedViews(Tester):
             # Cleanup
             session.execute("DROP MATERIALIZED VIEW mv")
             session.execute("DROP TABLE test")
+
+    def propagate_view_creation_over_non_existing_table(self):
+        """
+        The internal addition of a view over a non existing table should be ignored
+        @jira_ticket CASSANDRA-13737
+        """
+
+        cluster = self.cluster
+        cluster.populate(3)
+        cluster.start()
+        node1, node2, node3 = self.cluster.nodelist()
+        session = self.patient_cql_connection(node1, consistency_level=ConsistencyLevel.QUORUM)
+        create_ks(session, 'ks', 3)
+
+        session.execute('CREATE TABLE users (username varchar PRIMARY KEY, state varchar)')
+
+        # create a materialized view only in nodes 1 and 2
+        node3.stop(wait_other_notice=True)
+        session.execute(('CREATE MATERIALIZED VIEW users_by_state AS '
+                         'SELECT * FROM users WHERE state IS NOT NULL AND username IS NOT NULL '
+                         'PRIMARY KEY (state, username)'))
+
+        # drop the base table only in node 3
+        node1.stop(wait_other_notice=True)
+        node2.stop(wait_other_notice=True)
+        node3.start(wait_for_binary_proto=True)
+        session = self.patient_cql_connection(node3, consistency_level=ConsistencyLevel.QUORUM)
+        session.execute('DROP TABLE ks.users')
+
+        # restart the cluster
+        cluster.stop()
+        cluster.start()
+
+        # node3 should have received and ignored the creation of the MV over the dropped table
+        self.assertTrue(node3.grep_log('Not adding view users_by_state because the base table'))
+
+    def base_view_consistency_on_failure_after_mv_apply_test(self):
+        self._test_base_view_consistency_on_crash("after")
+
+    def base_view_consistency_on_failure_before_mv_apply_test(self):
+        self._test_base_view_consistency_on_crash("before")
+
+    def _test_base_view_consistency_on_crash(self, fail_phase):
+        """
+         * Fails base table write before or after applying views
+         * Restart node and replay commit and batchlog
+         * Check that base and views are present
+
+         @jira_ticket CASSANDRA-13069
+        """
+
+        self.cluster.set_batch_commitlog(enabled=True)
+        self.ignore_log_patterns = [r'Dummy failure', r"Failed to force-recycle all segments"]
+        self.prepare(rf=1, install_byteman=True)
+        node1, node2, node3 = self.cluster.nodelist()
+        session = self.patient_exclusive_cql_connection(node1)
+        session.execute('USE ks')
+
+        session.execute("CREATE TABLE t (id int PRIMARY KEY, v int, v2 text, v3 decimal)")
+        session.execute(("CREATE MATERIALIZED VIEW t_by_v AS SELECT * FROM t "
+                         "WHERE v IS NOT NULL AND id IS NOT NULL PRIMARY KEY (v, id)"))
+
+        session.cluster.control_connection.wait_for_schema_agreement()
+
+        debug('Make node1 fail {} view writes'.format(fail_phase))
+        node1.byteman_submit(['./byteman/fail_{}_view_write.btm'.format(fail_phase)])
+
+        debug('Write 1000 rows - all node1 writes should fail')
+
+        failed = False
+        for i in xrange(1, 1000):
+            try:
+                session.execute("INSERT INTO t (id, v, v2, v3) VALUES ({v}, {v}, 'a', 3.0) USING TIMESTAMP {v}".format(v=i))
+            except WriteFailure:
+                failed = True
+
+        self.assertTrue(failed, "Should fail at least once.")
+        self.assertTrue(node1.grep_log("Dummy failure"), "Should throw Dummy failure")
+
+        missing_entries = 0
+        session = self.patient_exclusive_cql_connection(node1)
+        session.execute('USE ks')
+        for i in xrange(1, 1000):
+            view_entry = rows_to_list(session.execute(SimpleStatement("SELECT * FROM t_by_v WHERE id = {} AND v = {}".format(i, i),
+                                                      consistency_level=ConsistencyLevel.ONE)))
+            base_entry = rows_to_list(session.execute(SimpleStatement("SELECT * FROM t WHERE id = {}".format(i),
+                                                      consistency_level=ConsistencyLevel.ONE)))
+
+            if not base_entry:
+                missing_entries += 1
+            if not view_entry:
+                missing_entries += 1
+
+        debug("Missing entries {}".format(missing_entries))
+        self.assertTrue(missing_entries > 0, )
+
+        debug('Restarting node1 to ensure commit log is replayed')
+        node1.stop(wait_other_notice=True)
+        # Set batchlog.replay_timeout_seconds=1 so we can ensure batchlog will be replayed below
+        node1.start(jvm_args=["-Dcassandra.batchlog.replay_timeout_in_ms=1"])
+
+        debug('Replay batchlogs')
+        time.sleep(0.001)  # Wait batchlog.replay_timeout_in_ms=1 (ms)
+        self._replay_batchlogs()
+
+        debug('Verify that both the base table entry and view are present after commit and batchlog replay')
+        session = self.patient_exclusive_cql_connection(node1)
+        session.execute('USE ks')
+        for i in xrange(1, 1000):
+            view_entry = rows_to_list(session.execute(SimpleStatement("SELECT * FROM t_by_v WHERE id = {} AND v = {}".format(i, i),
+                                                      consistency_level=ConsistencyLevel.ONE)))
+            base_entry = rows_to_list(session.execute(SimpleStatement("SELECT * FROM t WHERE id = {}".format(i),
+                                                      consistency_level=ConsistencyLevel.ONE)))
+
+            self.assertTrue(base_entry, "Both base {} and view entry {} should exist.".format(base_entry, view_entry))
+            self.assertTrue(view_entry, "Both base {} and view entry {} should exist.".format(base_entry, view_entry))
 
 
 # For read verification
