@@ -1,3 +1,10 @@
+from __future__ import print_function
+from __future__ import print_function
+from __future__ import print_function
+from __future__ import print_function
+from __future__ import print_function
+from __future__ import print_function
+from __future__ import print_function
 from __future__ import with_statement
 
 import ConfigParser
@@ -88,7 +95,7 @@ DISABLE_VNODES = not CONFIG.vnodes
 
 
 if os.environ.get('DISABLE_VNODES', '').lower() in ('yes', 'true'):
-    print 'DISABLE_VNODES environment variable deprecated. Use `./run_dtests.py --vnodes false` instead.'
+    print('DISABLE_VNODES environment variable deprecated. Use `./run_dtests.py --vnodes false` instead.')
 
 
 CURRENT_TEST = ""
@@ -158,7 +165,7 @@ def find_libjemalloc():
         else:
             return stdout
     except Exception as exc:
-        print "Failed to run script to prelocate libjemalloc ({}): {}".format(script, exc)
+        print("Failed to run script to prelocate libjemalloc ({}): {}".format(script, exc))
         return ""
 
 
@@ -179,13 +186,13 @@ def reset_environment_vars():
 def warning(msg):
     LOG.warning(msg, extra={"current_test": CURRENT_TEST})
     if PRINT_DEBUG:
-        print "WARN: " + msg
+        print("WARN: " + msg)
 
 
 def debug(msg):
     LOG.debug(msg, extra={"current_test": CURRENT_TEST})
     if PRINT_DEBUG:
-        print msg
+        print(msg)
 
 
 debug("Python driver version in use: {}".format(cassandra.__version__))
@@ -596,7 +603,7 @@ class Tester(TestCase):
                 if failed or KEEP_LOGS:
                     self.copy_logs(self.cluster)
             except Exception as e:
-                print "Error saving log:", str(e)
+                print("Error saving log:", str(e))
             finally:
                 log_watch_thread = getattr(self, '_log_watch_thread', None)
                 cleanup_cluster(self.cluster, self.test_path, log_watch_thread)
@@ -727,6 +734,7 @@ def create_ks(session, name, rf):
         # we assume networkTopologyStrategy
         options = (', ').join(['\'%s\':%d' % (d, r) for d, r in rf.iteritems()])
         session.execute(query % (name, "'class':'NetworkTopologyStrategy', %s" % options))
+    time.sleep(2)
     session.execute('USE {}'.format(name))
 
 
@@ -773,7 +781,7 @@ def kill_windows_cassandra_procs():
                     pass
                 else:
                     if (pinfo['name'] == 'java.exe' and '-Dcassandra' in pinfo['cmdline']):
-                        print 'Found running cassandra process with pid: ' + str(pinfo['pid']) + '. Killing.'
+                        print('Found running cassandra process with pid: ' + str(pinfo['pid']) + '. Killing.')
                         psutil.Process(pinfo['pid']).kill()
         except ImportError:
             debug("WARN: psutil not installed. Cannot detect and kill "
@@ -1021,7 +1029,7 @@ class ReusableClusterTester(Tester):
                 if failed or KEEP_LOGS:
                     self.copy_logs(self.cluster)
             except Exception as e:
-                print "Error saving log:", str(e)
+                print("Error saving log:", str(e))
             finally:
                 reset_environment_vars()
                 if failed:

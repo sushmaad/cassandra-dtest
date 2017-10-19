@@ -9,25 +9,37 @@ import assertions
 from dtest import create_cf
 
 
-def create_c1c2_table(tester, session, read_repair=None):
-    create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'}, read_repair=read_repair)
+def create_c1c2_table(session, cf_name='cf', read_repair=None, compact_storage=True):
+    create_cf(session, cf_name, columns={'c1': 'text', 'c2': 'text'}, read_repair=read_repair, compact_storage=compact_storage)
 
 
-def insert_c1c2(session, keys=None, n=None, consistency=ConsistencyLevel.QUORUM):
+def insert_c1c2(session, keys=None,cf_name='cf', n=None, consistency=ConsistencyLevel.QUORUM):
     if (keys is None and n is None) or (keys is not None and n is not None):
         raise ValueError("Expected exactly one of 'keys' or 'n' arguments to not be None; "
                          "got keys={keys}, n={n}".format(keys=keys, n=n))
     if n:
         keys = list(range(n))
 
-    statement = session.prepare("INSERT INTO cf (key, c1, c2) VALUES (?, 'value1', 'value2')")
+    statement = session.prepare("INSERT INTO {} (key, c1, c2) VALUES (?, 'value1', 'value2')".format(cf_name))
+    statement.consistency_level = consistency
+
+    execute_concurrent_with_args(session, statement, [['k{}'.format(k)] for k in keys])
+
+def insert_cf(session, keys=None, n=None, consistency=ConsistencyLevel.QUORUM):
+    if (keys is None and n is None) or (keys is not None and n is not None):
+        raise ValueError("Expected exactly one of 'keys' or 'n' arguments to not be None; "
+                         "got keys={keys}, n={n}".format(keys=keys, n=n))
+    if n:
+        keys = list(range(n))
+
+    statement = session.prepare("INSERT INTO cf (key, c, v) VALUES (?, 'value1', 'value2')")
     statement.consistency_level = consistency
 
     execute_concurrent_with_args(session, statement, [['k{}'.format(k)] for k in keys])
 
 
-def query_c1c2(session, key, consistency=ConsistencyLevel.QUORUM, tolerate_missing=False, must_be_missing=False):
-    query = SimpleStatement('SELECT c1, c2 FROM cf WHERE key=\'k%d\'' % key, consistency_level=consistency)
+def query_c1c2(session, key, cf_name='cf', consistency=ConsistencyLevel.QUORUM, tolerate_missing=False, must_be_missing=False):
+    query = SimpleStatement('SELECT c1, c2 FROM  %s WHERE key=\'k%d\'' % (cf_name, key), consistency_level=consistency)
     rows = list(session.execute(query))
     if not tolerate_missing:
         assertions.assert_length_equal(rows, 1)
